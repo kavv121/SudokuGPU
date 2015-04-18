@@ -224,6 +224,157 @@ ending:
     }
 }
 
+template<int RSIZE>
+__global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
+    __shared__ SudokuState<RSIZE*RSIZE> s;
+    __shared__ int block_status, block_ok;
+    __shared__ uint32_t bit_counts[RSIZE*RSIZE];
+    const int r = threadIdx.x;
+    const int c = threadIdx.y;
+    if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;}
+    //copy current values
+    const uint32_t myval = p->bitstate[r][c];
+    s.bitstate[r][c] = myval; 
+    /* Strategy: "transpose" the matrix of digits x spots, look for
+       pair of digits that in total exist in 2 cells */
+
+    //rows
+    for(int row=0;row<RSIZE*RSIZE;++row) {
+        bit_counts[r] = 0;
+        __syncthreads();
+        //look at bit r of cell c
+        if(s.bitstate[row][c] & (1<<r)) {
+            atomicOr(&bit_counts[r], (1u << c));
+        }
+        __syncthreads();
+        if(!block_ok){break;}
+        //check if the pair of digits (r,c) happens in exactly 2 places
+        if(r < c) {
+            uint32_t x = (bit_counts[r] | bit_counts[c]);
+            uint32_t xx = x;
+            if(x != 0) {
+                x &= x-1;
+                if(x == 0) {
+                    //we have two digits that want to go into 1 cell.
+                    //That's no good!
+                    block_ok = 0;
+                }
+                else if(((x&(x-1)) == 0)) {
+                    //r and c are a pair!
+                    //we set to two cells with this pair to the bitmask
+                    //with bits r an c on
+                    const uint32_t qq = (1u<<r) | (1u<<c);
+                    for(int t=0;t<RSIZE*RSIZE;++t) {
+                        if(xx & (1u<<t)) 
+                        {
+                            if(qq != (qq | atomicAnd(&s.bitstate[row][t], qq))) {
+                                block_status = STAT_UPDATED;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if(!block_ok){goto ending;}
+    //columns
+    for(int col=0;col<RSIZE*RSIZE;++col) {
+        if(!block_ok){break;}
+        bit_counts[r] = 0;
+        __syncthreads();
+        //look at bit r of cell c
+        if(s.bitstate[c][col] & (1<<r)) {
+            atomicOr(&bit_counts[r], (1u << c));
+        }
+        __syncthreads();
+        //check if the pair of digits (r,c) happens in exactly 2 places
+        if(r < c) {
+            uint32_t x = (bit_counts[r] | bit_counts[c]);
+            uint32_t xx = x;
+            if(x != 0) {
+                x &= x-1;
+                if(x == 0) {
+                    //we have two digits that want to go into 1 cell.
+                    //That's no good!
+                    block_ok = 0;
+                }
+                else if(((x&(x-1)) == 0)) {
+                    //r and c are a pair!
+                    //we set to two cells with this pair to the bitmask
+                    //with bits r an c on
+                    const uint32_t qq = (1u<<r) | (1u<<c);
+                    for(int t=0;t<RSIZE*RSIZE;++t) {
+                        if(xx & (1u<<t)) 
+                        {
+                            if(qq != (qq|atomicAnd(&s.bitstate[t][col], qq))) {
+                                block_status = STAT_UPDATED;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if(!block_ok){goto ending;}
+    //regions
+
+    for(int regionid=0;regionid<RSIZE*RSIZE;++regionid) {
+        const int baser = RSIZE*(regionid/RSIZE);
+        const int basec = RSIZE*(regionid%RSIZE);
+        if(!block_ok){break;}
+
+        bit_counts[r] = 0;
+        __syncthreads();
+        //look at bit r of cell c
+        if(s.bitstate[baser+(c/RSIZE)][basec+(c%RSIZE)] & (1<<r)) {
+            atomicOr(&bit_counts[r], (1u << c));
+        }
+        __syncthreads();
+        //check if the pair of digits (r,c) happens in exactly 2 places
+        if(r < c) {
+            uint32_t x = (bit_counts[r] | bit_counts[c]);
+            uint32_t xx = x;
+            if(x != 0) {
+                x &= x-1;
+                if(x == 0) {
+                    //we have two digits that want to go into 1 cell.
+                    //That's no good!
+                    block_ok = 0;
+                }
+                else if(((x&(x-1)) == 0)) {
+                    //r and c are a pair!
+                    //we set to two cells with this pair to the bitmask
+                    //with bits r an c on
+                    const uint32_t qq = (1u<<r) | (1u<<c);
+                    for(int t=0;t<RSIZE*RSIZE;++t) {
+                        if(xx & (1u<<t)) 
+                        {
+                            if(qq != (qq|atomicAnd(&s.bitstate[baser+(t/RSIZE)][basec+(t%RSIZE)], qq))) {
+                                block_status = STAT_UPDATED;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    
+ending:
+    if(block_ok && block_status == STAT_UPDATED)
+    { //implies ok && finalval has 1 bit set
+        p->bitstate[r][c] = s.bitstate[r][c];
+    }
+    __syncthreads();
+    if(r == 0 && c == 0) {
+        if(!block_ok) {
+            block_status = STAT_NOTOK;
+        }
+        *rc = block_status;
+    }
+}
+
 template<int SIZE>
 void fill_state_from_problem(SudokuState<SIZE> *state, const SudokuProblem<SIZE> &problem) {
     memset(state, 0, sizeof(SudokuState<SIZE>));
@@ -333,6 +484,13 @@ void test_basics(SudokuState<9> &state) {
         GPU_CHECKERROR(cudaMemcpy(&h_rc, d_rc, sizeof(int), cudaMemcpyDeviceToHost));
         cudaDeviceSynchronize();
         fprintf(stderr, "SINGLETON - GOT RC %d\n", h_rc);
+        if(h_rc != STAT_NOCHG){continue;}
+
+        pair_search<3><<<num_block, threads_per_block>>>(d_state, d_rc);
+        GPU_CHECKERROR(cudaGetLastError());
+        GPU_CHECKERROR(cudaMemcpy(&h_rc, d_rc, sizeof(int), cudaMemcpyDeviceToHost));
+        cudaDeviceSynchronize();
+        fprintf(stderr, "PAIR SEARCH - GOT RC %d\n", h_rc);
         if(h_rc != STAT_NOCHG){continue;}
 
     }
