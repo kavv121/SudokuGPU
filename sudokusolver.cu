@@ -1,4 +1,6 @@
 #include <iostream>
+#include <string>
+#include <fstream>
 #include <fstream>
 #include <vector>
 #include <stdint.h>
@@ -840,23 +842,28 @@ void test_basics2(SudokuState<9> &state) {
     int h_rc;
     /* TODO: better timing */
     struct timeval tstart, tend;
+    const char *foo = getenv("CPUMODE");
 
     GPU_CHECKERROR(cudaMalloc((void **)&d_state, 
                               sizeof(SudokuState<9>)));
     GPU_CHECKERROR(cudaMalloc((void **)&d_rc, 
                               sizeof(int)));
     gettimeofday(&tstart, 0);
-    GPU_CHECKERROR(cudaMemset(d_rc, 0, sizeof(int)));
+    if(foo) {
+        h_rc = cpu_naive_recurse(&state);
+    }
+    else {
+        GPU_CHECKERROR(cudaMemset(d_rc, 0, sizeof(int)));
 
-    GPU_CHECKERROR(cudaMemcpy(d_state, &state, sizeof(SudokuState<9>), cudaMemcpyHostToDevice));
-    const dim3 num_block(1,1,1);
-    const dim3 threads_per_block(1,1,1);
-    sudokusolver_gpu_main<3><<<num_block, threads_per_block>>>(d_state, d_rc);
-    GPU_CHECKERROR(cudaGetLastError());
-    GPU_CHECKERROR(cudaMemcpy(&h_rc, d_rc, sizeof(int), cudaMemcpyDeviceToHost));
-    GPU_CHECKERROR(cudaMemcpy(&state, d_state, sizeof(SudokuState<9>), cudaMemcpyDeviceToHost));
-    cudaDeviceSynchronize();
-    //h_rc = cpu_naive_recurse(&state);
+        GPU_CHECKERROR(cudaMemcpy(d_state, &state, sizeof(SudokuState<9>), cudaMemcpyHostToDevice));
+        const dim3 num_block(1,1,1);
+        const dim3 threads_per_block(1,1,1);
+        sudokusolver_gpu_main<3><<<num_block, threads_per_block>>>(d_state, d_rc);
+        GPU_CHECKERROR(cudaGetLastError());
+        GPU_CHECKERROR(cudaMemcpy(&h_rc, d_rc, sizeof(int), cudaMemcpyDeviceToHost));
+        GPU_CHECKERROR(cudaMemcpy(&state, d_state, sizeof(SudokuState<9>), cudaMemcpyDeviceToHost));
+        cudaDeviceSynchronize();
+    }
     gettimeofday(&tend, 0);
     std::cerr << "GOT OVERALL RC " << h_rc << std::endl;
     std::cerr << "TOOK TIME " << timeval_diff(&tstart, &tend) * 1000.0 << " ms" << std::endl;
@@ -926,6 +933,42 @@ void test_basics(SudokuState<9> &state) {
 
 
 int main(int argc, char **argv) {
+    if(argc > 1) {
+        std::cerr << "Entering bulk mode on file " << argv[1] << std::endl;
+        std::ifstream fin(argv[1]);
+        std::vector<std::string> vs;
+        {
+            std::string s;
+            while(fin >> s) {
+                if(s.size() != 81){
+                    std::cerr << "Warning, incomplete string '" << s << "', skipping" << std::endl;
+                }
+                else {
+                    vs.push_back(s);
+                }
+            }
+        }
+        std::vector<SudokuState<9> > states(vs.size());
+        for(int i=0;i<vs.size();++i)
+        {
+            SudokuProblem<9> problem;
+            memset(&problem, 0, sizeof(problem));
+            const std::string &s = vs[i];
+            for(int t=0;t<s.size();++t) {
+                if(s[t] >= '1' && s[t] <= '9') {
+                    int dig = s[t] - '0';
+                    int r = t/9;
+                    int c = t%9;
+                    problem.givens[r][c] = dig;
+                }
+            }
+            fill_state_from_problem(&states[i], problem);
+        }
+        for(int i=0;i<states.size();++i) {
+            test_basics2(states[i]);
+        }
+        return 0;
+    }
     std::string s;
     std::cin >> s;
     if(s.size() != 81) {
