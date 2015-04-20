@@ -1,4 +1,4 @@
 NVCC := /usr/local/cuda/bin/nvcc
-NVCC_OPTS := -arch=sm_30
+NVCC_OPTS := -arch=sm_35 -rdc=true
 sudokusolver: sudokusolver.cu
-	$(NVCC) $(NVCC_OPTS) sudokusolver.cu -o sudokusolver
+	$(NVCC) $(NVCC_OPTS) sudokusolver.cu -lcudadevrt -o sudokusolver
