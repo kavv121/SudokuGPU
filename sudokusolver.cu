@@ -6,7 +6,7 @@
 #include <sys/time.h>
 
 
-#define GPUDEBUG
+//#define GPUDEBUG
 
 #ifdef GPUDEBUG
 #define GPU_PF(...) printf(__VA_ARGS__)
@@ -480,6 +480,7 @@ __global__ void intersection_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         }
         __syncthreads();
     }
+    /* TODO: row/box and col/box interaction */
     if(block_ok && block_status == STAT_UPDATED)
     { //implies ok && finalval has 1 bit set
         p->bitstate[r][c] = s.bitstate[r][c];
@@ -654,6 +655,150 @@ static double timeval_diff(const struct timeval *start, const struct timeval *en
                   (end->tv_sec  - start->tv_sec);
 }
 
+#define RSIZE 3
+#define SIZE 9
+__device__ int naive_recurse(SudokuState<9> *p) {
+    //const int RSIZE = 3;
+    //const int SIZE = RSIZE*RSIZE;
+    uint32_t hold_row[SIZE];
+    uint32_t hold_col[SIZE];
+    uint32_t hold_region[SIZE];
+    for(int r=0;r<SIZE;++r) {
+        for(int c=0;c<SIZE;++c) {
+            if(__popc(p->bitstate[r][c]) == 0){return 0;}
+        }
+    }
+    for(int r=0;r<SIZE;++r) {
+        for(int c=0;c<SIZE;++c) {
+            if(__popc(p->bitstate[r][c]) > 1 ){
+                uint32_t oldval = p->bitstate[r][c];
+                for(int q=0;q<SIZE;++q) {
+                    if(oldval & (1u<<q)) {
+                        const uint32_t mask = ~(1u<<q);
+                        const int baser = RSIZE * (r/RSIZE);
+                        const int basec = RSIZE * (c/RSIZE);
+                        //try doing this with q
+                        for(int i=0;i<SIZE;++i){
+                            if(i != c) {
+                                hold_row[i] = p->bitstate[r][i];
+                                p->bitstate[r][i] &= mask;
+                            }
+                            if(i != r) {
+                                hold_col[i] = p->bitstate[i][c];
+                                p->bitstate[i][c] &= mask;
+                            }
+                            const int nr = baser + (i/RSIZE);
+                            const int nc = basec + (i%RSIZE);
+                            if(!(nr == r && nc == c)) {
+                                hold_region[i] = p->bitstate[nr][nc];
+                                p->bitstate[nr][nc] &= mask;
+                            }
+                        }
+                        p->bitstate[r][c] = (1u<<q);
+                        if(naive_recurse(p)) {return 1;}
+                        p->bitstate[r][c] = oldval;
+                        for(int i=SIZE-1;i>=0;--i){
+                            const int nr = baser + (i/RSIZE);
+                            const int nc = basec + (i%RSIZE);
+                            if(!(nr == r && nc == c)) {
+                                p->bitstate[nr][nc] = hold_region[i];
+                            }
+                            if(i != r) {
+                                p->bitstate[i][c] = hold_col[i];
+                            }
+                            if(i != c) {
+                                p->bitstate[r][i] = hold_row[i];
+                            }
+                        }
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+int cpu_naive_recurse(SudokuState<9> *p) {
+    //const int RSIZE = 3;
+    //const int SIZE = RSIZE*RSIZE;
+    uint32_t hold_row[SIZE];
+    uint32_t hold_col[SIZE];
+    uint32_t hold_region[SIZE];
+    for(int r=0;r<SIZE;++r) {
+        for(int c=0;c<SIZE;++c) {
+            uint32_t x = p->bitstate[r][c];
+            if(x == 0){return 0;}
+            if(!(x & (x-1))) {
+                for(int i=0;i<SIZE;++i)
+                {
+                    if(i != r && p->bitstate[i][c] == x){return 0;}
+                    if(i != c && p->bitstate[r][i] == x){return 0;}
+                    const int nr = (RSIZE*(r/RSIZE))+(i/RSIZE);
+                    const int nc = (RSIZE*(c/RSIZE))+(i%RSIZE);
+                    if(!(nr == r && nc == c) && p->bitstate[nr][nc] == x){return 0;}
+                }
+            }
+        }
+    }
+    for(int r=0;r<SIZE;++r) {
+        for(int c=0;c<SIZE;++c) {
+            uint32_t oldval = p->bitstate[r][c];
+            if((oldval & (oldval-1)) != 0){
+                for(int q=0;q<SIZE;++q) {
+                    if(oldval & (1u<<q)) {
+                        const uint32_t mask = ~(1u<<q);
+                        const int baser = RSIZE * (r/RSIZE);
+                        const int basec = RSIZE * (c/RSIZE);
+                        //try doing this with q
+                        for(int i=0;i<SIZE;++i){
+                            if(i != c) {
+                                hold_row[i] = p->bitstate[r][i];
+                                p->bitstate[r][i] &= mask;
+                            }
+                            if(i != r) {
+                                hold_col[i] = p->bitstate[i][c];
+                                p->bitstate[i][c] &= mask;
+                            }
+                            const int nr = baser + (i/RSIZE);
+                            const int nc = basec + (i%RSIZE);
+                            if(!(nr == r && nc == c)) {
+                                hold_region[i] = p->bitstate[nr][nc];
+                                p->bitstate[nr][nc] &= mask;
+                            }
+                        }
+                        p->bitstate[r][c] = (1u<<q);
+                        if(cpu_naive_recurse(p)) {return 1;}
+                        p->bitstate[r][c] = oldval;
+                        for(int i=SIZE-1;i>=0;--i){
+                            const int nr = baser + (i/RSIZE);
+                            const int nc = basec + (i%RSIZE);
+                            if(!(nr == r && nc == c)) {
+                                p->bitstate[nr][nc] = hold_region[i];
+                            }
+                            if(i != r) {
+                                p->bitstate[i][c] = hold_col[i];
+                            }
+                            if(i != c) {
+                                p->bitstate[r][i] = hold_row[i];
+                            }
+                        }
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+#undef RSIZE
+#undef SIZE
+
+__global__ void sudokusolver_gpu_naive(SudokuState<9> *p, int *rc) {
+    int rrc = naive_recurse(p);
+    *rc = rrc;
+}
+
+
 template<int RSIZE>
 __global__ void sudokusolver_gpu_main(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     const dim3 num_block(1,1,1);
@@ -711,6 +856,7 @@ void test_basics2(SudokuState<9> &state) {
     GPU_CHECKERROR(cudaMemcpy(&h_rc, d_rc, sizeof(int), cudaMemcpyDeviceToHost));
     GPU_CHECKERROR(cudaMemcpy(&state, d_state, sizeof(SudokuState<9>), cudaMemcpyDeviceToHost));
     cudaDeviceSynchronize();
+    //h_rc = cpu_naive_recurse(&state);
     gettimeofday(&tend, 0);
     std::cerr << "GOT OVERALL RC " << h_rc << std::endl;
     std::cerr << "TOOK TIME " << timeval_diff(&tstart, &tend) * 1000.0 << " ms" << std::endl;
