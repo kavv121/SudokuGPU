@@ -61,6 +61,12 @@ void print_state(const SudokuState<SIZE> &s) {
     }
 }
 
+__device__ inline void do_remove_mask(uint32_t *data, int mask, int *bstatus) {
+    if(atomicAnd(data, ~mask) & mask){
+        *bstatus = STAT_UPDATED;
+    }
+}
+
 template<int RSIZE>
 __global__ void simple_cand_elim(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     __shared__ SudokuState<RSIZE*RSIZE> s;
@@ -86,19 +92,13 @@ __global__ void simple_cand_elim(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     //row
     for(int oc=0;oc<RSIZE*RSIZE;++oc) {
         if(oc != c) {
-            uint32_t old = atomicAnd(&s.bitstate[r][oc], ~myval);
-            if((old & (~myval)) != old) {
-                block_status = STAT_UPDATED;
-            }
+            do_remove_mask(&s.bitstate[r][oc], myval, &block_status);
         }
     }
     //column
     for(int row=0;row<RSIZE*RSIZE;++row) {
         if(row != r) {
-            uint32_t old = atomicAnd(&s.bitstate[row][c], ~myval);
-            if((old & (~myval)) != old) {
-                block_status = STAT_UPDATED;
-            }
+            do_remove_mask(&s.bitstate[row][c], myval, &block_status);
         }
     }
     //block
@@ -110,10 +110,7 @@ __global__ void simple_cand_elim(SudokuState<RSIZE*RSIZE> *p, int *rc) {
                 if(baser + dr == r && basec + dc == c) {
                     continue;
                 }
-                uint32_t old = atomicAnd(&s.bitstate[baser+dr][basec+dc], ~myval);
-                if((old & (~myval)) != old) {
-                    block_status = STAT_UPDATED;
-                }
+                do_remove_mask(&s.bitstate[baser+dr][basec+dc], myval, &block_status);
             }
         }
     }
@@ -140,7 +137,6 @@ __global__ void singleton_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     const uint32_t myval = p->bitstate[r][c];
     s.bitstate[r][c] = myval; 
     __syncthreads();
-
 
     
     uint32_t finalval = 0;
@@ -284,7 +280,7 @@ __global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         }
         __syncthreads();
         //check if the pair of cells (r, c) are the same and have only 2 digits
-        if(0 && r < c) {
+        if(r < c) {
             const uint32_t cella = s.bitstate[row][r];
             const uint32_t cellb = s.bitstate[row][c];
             if(cella == cellb) {
@@ -292,10 +288,7 @@ __global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
                     //we found a pair of digits, apply it to everything else
                     for(int t=0;t<RSIZE*RSIZE;++t) {
                         if(t != r && t != c) {
-                            uint32_t curr = s.bitstate[row][t];
-                            if(curr != atomicAnd(&s.bitstate[row][t], ~(cella))) {
-                                block_status = STAT_UPDATED;
-                            }
+                            do_remove_mask(&s.bitstate[row][t], cella, &block_status);
                         }
                     }
                 }
@@ -339,7 +332,7 @@ __global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         }
         __syncthreads();
         //check if the pair of cells (r, c) are the same and have only 2 digits
-        if(0 && r < c) {
+        if(r < c) {
             const uint32_t cella = s.bitstate[r][col];
             const uint32_t cellb = s.bitstate[c][col];
             if(cella == cellb) {
@@ -347,10 +340,7 @@ __global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
                     //we found a pair of digits, apply it to everything else
                     for(int t=0;t<RSIZE*RSIZE;++t) {
                         if(t != r && t != c) {
-                            uint32_t curr = s.bitstate[t][col];
-                            if(curr != atomicAnd(&s.bitstate[t][col], ~(cella))) {
-                                block_status = STAT_UPDATED;
-                            }
+                            do_remove_mask(&s.bitstate[t][col], cella, &block_status);
                         }
                     }
                 }
@@ -399,18 +389,15 @@ __global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         }
         __syncthreads();
         //check if the pair of cells (r, c) are the same and have only 2 digits
-        if(0 && r < c) {
-            const uint32_t cella = s.bitstate[baser+(r/RSIZE)][basec+(r/RSIZE)];
-            const uint32_t cellb = s.bitstate[baser+(c/RSIZE)][basec+(c/RSIZE)];
+        if(r < c) {
+            const uint32_t cella = s.bitstate[baser+(r/RSIZE)][basec+(r%RSIZE)];
+            const uint32_t cellb = s.bitstate[baser+(c/RSIZE)][basec+(c%RSIZE)];
             if(cella == cellb) {
                 if(2 == __popc(cella)) {
                     //we found a pair of digits, apply it to everything else
                     for(int t=0;t<RSIZE*RSIZE;++t) {
                         if(t != r && t != c) {
-                            uint32_t curr = s.bitstate[baser+(t/RSIZE)][basec+(t%RSIZE)];
-                            if(curr != atomicAnd(&s.bitstate[baser+(t/RSIZE)][basec+(t%RSIZE)], ~(cella))) {
-                                block_status = STAT_UPDATED;
-                            }
+                            do_remove_mask(&s.bitstate[baser+(t/RSIZE)][basec+(t%RSIZE)], cella, &block_status);
                         }
                     }
                 }
@@ -471,38 +458,107 @@ __global__ void intersection_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         //if bit counts mask == 000xxx000
         //  eliminate rest in row 1
         //...
+        //TODO: generalize this instead of hardcoding 9x9 values
         {
-            const int bc = __popc(bit_counts[r]);
-            if(bc == 2 || bc == 3) {
-                //row intersection
-                if(!(c >= basec && c < basec+3)) {
-                    for(int x=0,mymask=0x7;x<3;++x, mymask<<=3) {
-                        if((bit_counts[r] & mymask) == bit_counts[r]) {
-                            uint32_t curr = s.bitstate[baser+x][c];
-                            if(curr != atomicAnd(&s.bitstate[baser+x][c], ~(1u<<r))){
-                                block_status = STAT_UPDATED;
-                            }
-                        }
+            //row intersection
+            if(!(c >= basec && c < basec+RSIZE)) {
+                for(int x=0,mymask=((1u<<RSIZE)-1);x<RSIZE;++x, mymask<<=RSIZE) {
+                    if((bit_counts[r] & mymask) == bit_counts[r]) {
+                        do_remove_mask(&s.bitstate[baser+x][c], (1u<<r), &block_status);
                     }
                 }
-                //column intersection
-                if(!(c >= baser && c < baser+3)) {
-                    for(int x=0,mymask=0x49;x<3;++x, mymask<<=1) {
-                        if((bit_counts[r] & mymask) == bit_counts[r]) {
-                            uint32_t curr = s.bitstate[c][basec+x];
-                            if(curr != atomicAnd(&s.bitstate[c][basec+x], ~(1u<<r))){
-                                block_status = STAT_UPDATED;
-                            }
-                        }
+            }
+            //column intersection
+            if(!(c >= baser && c < baser+RSIZE)) {
+                //TODO: find correct mask for given RSIZE
+                for(int x=0,mymask=0x49;x<RSIZE;++x, mymask<<=1) {
+                    if((bit_counts[r] & mymask) == bit_counts[r]) {
+                        do_remove_mask(&s.bitstate[c][basec+x], (1u<<r), &block_status);
                     }
                 }
             }
         }
         __syncthreads();
     }
-ending:
     if(block_ok && block_status == STAT_UPDATED)
     { //implies ok && finalval has 1 bit set
+        p->bitstate[r][c] = s.bitstate[r][c];
+    }
+    __syncthreads();
+    if(r == 0 && c == 0) {
+        if(!block_ok) {
+            block_status = STAT_NOTOK;
+        }
+        *rc = block_status;
+    }
+}
+
+template<int RSIZE>
+__global__ void xwing_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
+    __shared__ SudokuState<RSIZE*RSIZE> s;
+    __shared__ int block_status, block_ok;
+    __shared__ uint32_t bit_counts[RSIZE*RSIZE];
+    const int r = threadIdx.x;
+    const int c = threadIdx.y;
+    if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;}
+    //copy current values
+    const uint32_t myval = p->bitstate[r][c];
+    s.bitstate[r][c] = myval; 
+    __syncthreads();
+
+    for(int dig=0;dig<RSIZE*RSIZE;++dig) {
+        //look by row
+        if(c == 0)
+            bit_counts[r] = 0;
+        __syncthreads();
+        if((s.bitstate[r][c] & (1u<<dig))) {
+            atomicOr(&bit_counts[r], (1u << c));
+        }
+        __syncthreads();
+        //now we look for 2 rows that are identical and
+        //have exactly two spots open
+        if(r < c) {
+            if(bit_counts[r] == bit_counts[c] && __popc(bit_counts[r]) == 2) {
+                //we have to remove this digit from the other things in the two bits that are there
+                int col_a = __ffs(bit_counts[r])-1;
+                int col_b = 31-__clz(bit_counts[r]);
+                //GPU_PF("Found xw %x %d by row %d %d, cols %d %d\n", bit_counts[r], dig, r, c, col_a, col_b);
+
+                for(int t=0;t<RSIZE*RSIZE;++t) {
+                    if(t != r && t != c) {
+                        do_remove_mask(&s.bitstate[t][col_a], (1u << dig), &block_status);
+                        do_remove_mask(&s.bitstate[t][col_b], (1u << dig), &block_status);
+                    }
+                }
+            }
+        }
+        //now look by column
+        if(c == 0)
+            bit_counts[r] = 0;
+        __syncthreads();
+        if((s.bitstate[r][c] & (1u<<dig))) {
+            atomicOr(&bit_counts[c], (1u << r));
+        }
+        __syncthreads();
+        if(r < c) {
+            if(bit_counts[r] == bit_counts[c] && __popc(bit_counts[r]) == 2) {
+                //we have to remove this digit from the other things in the two bits that are there
+                int row_a = __ffs(bit_counts[r])-1;
+                int row_b = 31-__clz(bit_counts[r]);
+                //GPU_PF("Found xw %x %d by col %d %d, rows %d %d\n", bit_counts[r], dig, r, c, row_a, row_b);
+                for(int t=0;t<RSIZE*RSIZE;++t) {
+                    if(t != r && t != c) {
+                        do_remove_mask(&s.bitstate[row_a][t], (1u << dig), &block_status);
+                        do_remove_mask(&s.bitstate[row_b][t], (1u << dig), &block_status);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if(block_ok && block_status == STAT_UPDATED)
+    {
         p->bitstate[r][c] = s.bitstate[r][c];
     }
     __syncthreads();
@@ -611,19 +667,24 @@ __global__ void sudokusolver_gpu_main(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         GPU_PF("SIMPLE - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
 
-        singleton_search<3><<<num_block, threads_per_block>>>(p,rc);
+        singleton_search<RSIZE><<<num_block, threads_per_block>>>(p,rc);
         cudaDeviceSynchronize();
         GPU_PF("SINGLETON - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
 
-        pair_search<3><<<num_block, threads_per_block>>>(p, rc);
+        pair_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
         cudaDeviceSynchronize();
         GPU_PF("PAIR SEARCH - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
 
-        intersection_search<3><<<num_block, threads_per_block>>>(p, rc);
+        intersection_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
         cudaDeviceSynchronize();
         GPU_PF("INTERSECTION SEARCH - GOT RC %d\n", *rc);
+        if(*rc != STAT_NOCHG){continue;}
+
+        xwing_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
+        cudaDeviceSynchronize();
+        GPU_PF("XWING SEARCH - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
     }
 }
@@ -655,7 +716,6 @@ void test_basics2(SudokuState<9> &state) {
     std::cerr << "TOOK TIME " << timeval_diff(&tstart, &tend) * 1000.0 << " ms" << std::endl;
     cudaFree(d_state);
     cudaFree(d_rc);
-    //print_state(state);
     check_state<3>(state);
 }
 
