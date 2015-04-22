@@ -29,7 +29,8 @@ static void gpuCheckError( cudaError_t err,
 enum {
     STAT_NOCHG = 0,
     STAT_UPDATED = 1,
-    STAT_NOTOK = 2
+    STAT_NOTOK = 2,
+    STAT_FINISHED = 3,
 };
 
 enum {
@@ -70,6 +71,71 @@ __device__ inline void do_remove_mask(uint32_t *data, int mask, int *bstatus) {
 }
 
 template<int RSIZE>
+__global__ void quickcheck(SudokuState<RSIZE*RSIZE> *p, int *rc) {
+    __shared__ int block_status, block_ok;
+    __shared__ int nogood;
+    __shared__ char tmp_block[RSIZE*RSIZE][RSIZE*RSIZE];
+    const int r = threadIdx.x;
+    const int c = threadIdx.y;
+    if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;nogood=0;}
+    //copy current values
+    const uint32_t myval = p->bitstate[r][c];
+    const int mydig = __ffs(myval)-1;
+    __syncthreads();
+    if(myval == 0) {
+        GPU_PF("Bad tidings in (%d,%d)\n", r, c);
+        block_ok = 0;
+        nogood = 1;
+    }
+    else if(myval&(myval-1)) {
+        nogood=1;
+    }
+
+    __syncthreads();
+    if(nogood){goto ending;}
+    //now everything is a singleton, so we can check every constraint and we will get yes/no
+    //rows
+    tmp_block[r][c] = 0;
+    __syncthreads();
+    tmp_block[r][mydig] = 1;
+    __syncthreads();
+    if(tmp_block[r][c] == 0) {
+        block_ok = 0;
+    }
+    //cols
+    tmp_block[r][c] = 0;
+    __syncthreads();
+    tmp_block[c][mydig] = 1;
+    __syncthreads();
+    if(tmp_block[r][c] == 0) {
+        block_ok = 0;
+    }
+    //regions
+    tmp_block[r][c] = 0;
+    __syncthreads();
+    tmp_block[RSIZE*(r/RSIZE) + (c/RSIZE)][mydig] = 1;
+    __syncthreads();
+    if(tmp_block[r][c] == 0) {
+        block_ok = 0;
+    }
+
+ending:;
+    __syncthreads();
+    if(r == 0 && c == 0) {
+        if(!block_ok) {
+            block_status = STAT_NOTOK;
+        }
+        else if(!nogood) {
+            block_status = STAT_FINISHED;
+        }
+        *rc = block_status;
+    }
+}
+
+
+
+
+template<int RSIZE>
 __global__ void simple_cand_elim(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     __shared__ SudokuState<RSIZE*RSIZE> s;
     __shared__ int block_status, block_ok;
@@ -78,7 +144,7 @@ __global__ void simple_cand_elim(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;}
     //copy current values
     const uint32_t myval = p->bitstate[r][c];
-    s.bitstate[r][c] = myval; 
+    s.bitstate[r][c] = myval;
     s.work_flag[r][c] = p->work_flag[r][c];
     __syncthreads();
     if(myval == 0) {
@@ -137,10 +203,10 @@ __global__ void singleton_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;}
     //copy current values
     const uint32_t myval = p->bitstate[r][c];
-    s.bitstate[r][c] = myval; 
+    s.bitstate[r][c] = myval;
     __syncthreads();
 
-    
+
     uint32_t finalval = 0;
     bool ok = true;
     //don't bother if this is already a singleton or nothing
@@ -242,7 +308,7 @@ __global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;}
     //copy current values
     const uint32_t myval = p->bitstate[r][c];
-    s.bitstate[r][c] = myval; 
+    s.bitstate[r][c] = myval;
     /* Strategy: "transpose" the matrix of digits x spots, look for
        pair of digits that in total exist in 2 cells */
 
@@ -271,7 +337,7 @@ __global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
                 //with bits r an c on
                 const uint32_t qq = (1u<<r) | (1u<<c);
                 for(int t=0;t<RSIZE*RSIZE;++t) {
-                    if(x & (1u<<t)) 
+                    if(x & (1u<<t))
                     {
                         if(qq != (qq | atomicAnd(&s.bitstate[row][t], qq))) {
                             block_status = STAT_UPDATED;
@@ -323,7 +389,7 @@ __global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
                 //with bits r an c on
                 const uint32_t qq = (1u<<r) | (1u<<c);
                 for(int t=0;t<RSIZE*RSIZE;++t) {
-                    if(x & (1u<<t)) 
+                    if(x & (1u<<t))
                     {
                         if(qq != (qq|atomicAnd(&s.bitstate[t][col], qq))) {
                             block_status = STAT_UPDATED;
@@ -380,7 +446,7 @@ __global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
                 //with bits r an c on
                 const uint32_t qq = (1u<<r) | (1u<<c);
                 for(int t=0;t<RSIZE*RSIZE;++t) {
-                    if(x & (1u<<t)) 
+                    if(x & (1u<<t))
                     {
                         if(qq != (qq|atomicAnd(&s.bitstate[baser+(t/RSIZE)][basec+(t%RSIZE)], qq))) {
                             block_status = STAT_UPDATED;
@@ -408,10 +474,216 @@ __global__ void pair_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     }
     __syncthreads();
 
-    
+
 ending:
     if(block_ok && block_status == STAT_UPDATED)
     { //implies ok && finalval has 1 bit set
+        p->bitstate[r][c] = s.bitstate[r][c];
+    }
+    __syncthreads();
+    if(r == 0 && c == 0) {
+        if(!block_ok) {
+            block_status = STAT_NOTOK;
+        }
+        *rc = block_status;
+    }
+}
+
+template<int RSIZE>
+__global__ void triple_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
+    __shared__ SudokuState<RSIZE*RSIZE> s;
+    __shared__ int block_status, block_ok;
+    __shared__ uint32_t bit_counts[RSIZE*RSIZE];
+    const int r = threadIdx.x;
+    const int c = threadIdx.y;
+    if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;}
+    //copy current values
+    const uint32_t myval = p->bitstate[r][c];
+    s.bitstate[r][c] = myval;
+
+    //rows
+    for(int row=0;row<RSIZE*RSIZE;++row) {
+        bit_counts[r] = 0;
+        __syncthreads();
+        //look at bit r of cell c
+        if(s.bitstate[row][c] & (1<<r)) {
+            atomicOr(&bit_counts[r], (1u << c));
+        }
+        __syncthreads();
+        if(!block_ok){break;}
+
+        //check if the pair of digits (r,c) has a third digit so that they happen in exactly 3 places
+        if(r < c) {
+            const uint32_t xx = (bit_counts[r] | bit_counts[c]);
+            for(int odig=c+1;odig<RSIZE*RSIZE;++odig) {
+                const uint32_t x = (bit_counts[odig] | xx);
+                int ct = __popc(x);
+                if(ct <= 2) {
+                    //There aren't enough cells
+                    //That's no good!
+                    block_ok = 0;
+                }
+                else if(ct == 3) {
+                    const uint32_t qq = (1u<<r)|(1u<<c)|(1u<<odig);
+                    for(int t=0;t<RSIZE*RSIZE;++t) {
+                        if(x & (1u<<t))
+                        {
+                            if(qq != (qq | atomicAnd(&s.bitstate[row][t], qq))) {
+                                block_status = STAT_UPDATED;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        //check if the pair of cells (r, c) has a third cell that has only 3 digits
+        if(r < c) {
+            const uint32_t basepair = (
+                    s.bitstate[row][r]|
+                    s.bitstate[row][c]);
+            if(__popc(basepair) <= 3) {
+                for(int ocell=c+1;ocell<RSIZE*RSIZE;++ocell) {
+                    const uint32_t tmask = (basepair|
+                             s.bitstate[row][ocell]);
+                    if(__popc(tmask) == 3) {
+                        for(int t=0;t<RSIZE*RSIZE;++t) {
+                            if(t != r && t != c && t != ocell) {
+                                do_remove_mask(&s.bitstate[row][t],
+                                               tmask, &block_status);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if(!block_ok){goto ending;}
+    //columns
+    for(int col=0;col<RSIZE*RSIZE;++col) {
+        if(!block_ok){break;}
+        bit_counts[r] = 0;
+        __syncthreads();
+        //look at bit r of cell c
+        if(s.bitstate[c][col] & (1<<r)) {
+            atomicOr(&bit_counts[r], (1u << c));
+        }
+        __syncthreads();
+
+        //check if the pair of digits (r,c) has a third digit so that they happen in exactly 3 places
+        if(r < c) {
+            const uint32_t xx = (bit_counts[r] | bit_counts[c]);
+            for(int odig=c+1;odig<RSIZE*RSIZE;++odig) {
+                const uint32_t x = (bit_counts[odig] | xx);
+                int ct = __popc(x);
+                if(ct <= 2) {
+                    //There aren't enough cells
+                    //That's no good!
+                    block_ok = 0;
+                }
+                else if(ct == 3) {
+                    const uint32_t qq = (1u<<r)|(1u<<c)|(1u<<odig);
+                    for(int t=0;t<RSIZE*RSIZE;++t) {
+                        if(x & (1u<<t))
+                        {
+                            if(qq != (qq | atomicAnd(&s.bitstate[t][col], qq))) {
+                                block_status = STAT_UPDATED;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        //check if the pair of cells (r, c) has a third cell that has only 3 digits
+        if(r < c) {
+            const uint32_t basepair = (
+                    s.bitstate[r][col]|
+                    s.bitstate[c][col]);
+            if(__popc(basepair) <= 3) {
+                for(int ocell=c+1;ocell<RSIZE*RSIZE;++ocell) {
+                    const uint32_t tmask = (basepair|
+                             s.bitstate[ocell][col]);
+                    if(__popc(tmask) == 3) {
+                        for(int t=0;t<RSIZE*RSIZE;++t) {
+                            if(t != r && t != c && t != ocell) {
+                                do_remove_mask(&s.bitstate[t][col],
+                                               tmask, &block_status);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if(!block_ok){goto ending;}
+    //regions
+
+    for(int regionid=0;regionid<RSIZE*RSIZE;++regionid) {
+        const int baser = RSIZE*(regionid/RSIZE);
+        const int basec = RSIZE*(regionid%RSIZE);
+        if(!block_ok){break;}
+
+        bit_counts[r] = 0;
+        __syncthreads();
+        //look at bit r of cell c
+        if(s.bitstate[baser+(c/RSIZE)][basec+(c%RSIZE)] & (1<<r)) {
+            atomicOr(&bit_counts[r], (1u << c));
+        }
+        __syncthreads();
+
+        //check if the pair of digits (r,c) has a third digit so that they happen in exactly 3 places
+        if(r < c) {
+            const uint32_t xx = (bit_counts[r] | bit_counts[c]);
+            for(int odig=c+1;odig<RSIZE*RSIZE;++odig) {
+                const uint32_t x = (bit_counts[odig] | xx);
+                int ct = __popc(x);
+                if(ct <= 2) {
+                    //There aren't enough cells
+                    //That's no good!
+                    block_ok = 0;
+                }
+                else if(ct == 3) {
+                    const uint32_t qq = (1u<<r)|(1u<<c)|(1u<<odig);
+                    for(int t=0;t<RSIZE*RSIZE;++t) {
+                        if(x & (1u<<t))
+                        {
+                            if(qq != (qq | atomicAnd(&s.bitstate[baser+(t/RSIZE)][basec+(t%RSIZE)], qq))) {
+                                block_status = STAT_UPDATED;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        //check if the pair of cells (r, c) has a third cell that has only 3 digits
+        if(r < c) {
+            const uint32_t basepair = (
+                    s.bitstate[baser+(r/RSIZE)][basec+(r%RSIZE)]|
+                    s.bitstate[baser+(c/RSIZE)][basec+(c%RSIZE)]);
+            if(__popc(basepair) <= 3) {
+                for(int ocell=c+1;ocell<RSIZE*RSIZE;++ocell) {
+                    const uint32_t tmask = (basepair|
+                             s.bitstate[baser+(ocell/RSIZE)][basec+(ocell%RSIZE)]);
+                    if(__popc(tmask) == 3) {
+                        for(int t=0;t<RSIZE*RSIZE;++t) {
+                            if(t != r && t != c && t != ocell) {
+                                do_remove_mask(&s.bitstate[baser+(t/RSIZE)][basec+(t%RSIZE)],
+                                               tmask, &block_status);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+ending:
+    if(block_ok && block_status == STAT_UPDATED)
+    {
         p->bitstate[r][c] = s.bitstate[r][c];
     }
     __syncthreads();
@@ -434,7 +706,7 @@ __global__ void intersection_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;}
     //copy current values
     const uint32_t myval = p->bitstate[r][c];
-    s.bitstate[r][c] = myval; 
+    s.bitstate[r][c] = myval;
     __syncthreads();
     /* look for pairs/triples in box */
     for(int boxr=0;boxr<RSIZE;++boxr)
@@ -506,7 +778,7 @@ __global__ void xwing_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;}
     //copy current values
     const uint32_t myval = p->bitstate[r][c];
-    s.bitstate[r][c] = myval; 
+    s.bitstate[r][c] = myval;
     __syncthreads();
 
     for(int dig=0;dig<RSIZE*RSIZE;++dig) {
@@ -560,6 +832,84 @@ __global__ void xwing_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         __syncthreads();
     }
 
+    if(block_ok && block_status == STAT_UPDATED)
+    {
+        p->bitstate[r][c] = s.bitstate[r][c];
+    }
+    __syncthreads();
+    if(r == 0 && c == 0) {
+        if(!block_ok) {
+            block_status = STAT_NOTOK;
+        }
+        *rc = block_status;
+    }
+}
+
+template<int RSIZE>
+__global__ void ywing_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
+    __shared__ SudokuState<RSIZE*RSIZE> s;
+    __shared__ int block_status, block_ok;
+    //left versus right
+    __shared__ uint32_t bit_counts[RSIZE*RSIZE][RSIZE*RSIZE][2];
+    const int r = threadIdx.x;
+    const int c = threadIdx.y;
+    if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;}
+    //copy current values
+    const uint32_t myval = p->bitstate[r][c];
+    const int mybits = __popc(myval);
+    s.bitstate[r][c] = myval;
+    __syncthreads();
+
+    //iterate over every cell with exactly 2 values,
+    //propagate a search for other bivalued cells with one value in common,
+    //set bitmask for the other side to indicate that cell
+    //then take the set bitmasks and propagate those, hopefully you then have overlap to
+    //remove from main board
+
+    for(int keyr=0;keyr<RSIZE*RSIZE;++keyr) {
+        for(int keyc=0;keyc<RSIZE*RSIZE;++keyc) {
+            const uint32_t kval = s.bitstate[keyr][keyc];
+            const uint32_t lowval = __ffs(kval)-1;
+            if(__popc(kval) != 2){continue;}
+            bit_counts[r][c][0] = bit_counts[r][c][1] = 0;
+            __syncthreads();
+            //now attempt to propagate
+            if((r == keyr) || (c == keyc) || ((r/RSIZE) == (keyr/RSIZE) && (c/RSIZE) == (keyc/RSIZE))) {
+                if(mybits == 2) {
+                    uint32_t x = (myval & (~kval));
+                    if(x && !(x & (x-1))) {
+                        int target_idx = 0;
+                        if(myval == (x | (1u<<lowval))) {
+                            target_idx = 0;
+                        }
+                        else {
+                            target_idx = 1;
+                        }
+                        //propagate to all cells stemming from this one
+                        for(int t=0;t<9;++t) {
+                            if(t != c){
+                                atomicOr(&bit_counts[r][t][target_idx], x);
+                            }
+                            if(t != r) {
+                                atomicOr(&bit_counts[t][c][target_idx], x);
+                            }
+                            if(t != (RSIZE*(r%RSIZE) + (c%RSIZE))) {
+                                atomicOr(&bit_counts[RSIZE*(r/RSIZE)+(t/3)][RSIZE*(c/RSIZE)+(t%3)][target_idx], x);
+                            }
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            //now do intersection on each propagated thing
+            {
+                const uint32_t rval = (bit_counts[r][c][0]&bit_counts[r][c][1]);
+                if(rval) {
+                    do_remove_mask(&s.bitstate[r][c], rval, &block_status);
+                }
+            }
+        }
+    }
     if(block_ok && block_status == STAT_UPDATED)
     {
         p->bitstate[r][c] = s.bitstate[r][c];
@@ -660,7 +1010,7 @@ int check_state(const SudokuState<RSIZE*RSIZE> &s) {
 }
 
 static double timeval_diff(const struct timeval *start, const struct timeval *end) {
-    return 1e-6 * (end->tv_usec - start->tv_usec) + 
+    return 1e-6 * (end->tv_usec - start->tv_usec) +
                   (end->tv_sec  - start->tv_sec);
 }
 
@@ -816,6 +1166,11 @@ __global__ void sudokusolver_gpu_main(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         *rc = STAT_NOCHG;
         __syncthreads();
 
+        quickcheck<RSIZE><<<num_block, threads_per_block>>>(p, rc);
+        cudaDeviceSynchronize();
+        GPU_PF("QUICKCHECK - GOT RC %d\n", *rc);
+        if(*rc != STAT_NOCHG){continue;}
+
         simple_cand_elim<RSIZE><<<num_block, threads_per_block>>>(p, rc);
         cudaDeviceSynchronize();
         GPU_PF("SIMPLE - GOT RC %d\n", *rc);
@@ -831,6 +1186,11 @@ __global__ void sudokusolver_gpu_main(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         GPU_PF("PAIR SEARCH - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
 
+        triple_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
+        cudaDeviceSynchronize();
+        GPU_PF("TRIPLE SEARCH - GOT RC %d\n", *rc);
+        if(*rc != STAT_NOCHG){continue;}
+
         intersection_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
         cudaDeviceSynchronize();
         GPU_PF("INTERSECTION SEARCH - GOT RC %d\n", *rc);
@@ -840,21 +1200,32 @@ __global__ void sudokusolver_gpu_main(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         cudaDeviceSynchronize();
         GPU_PF("XWING SEARCH - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
+
+        ywing_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
+        cudaDeviceSynchronize();
+        GPU_PF("YWING SEARCH - GOT RC %d\n", *rc);
+        if(*rc != STAT_NOCHG){continue;}
+
     }
 }
 
-void test_basics2(SudokuState<9> &state) {
-    SudokuState<9> *d_state;
-    int *d_rc;
+static SudokuState<9> *d_state;
+static int *d_rc;
+static int gpumalloc = 0;
+
+int test_basics2(SudokuState<9> &state) {
     int h_rc;
     /* TODO: better timing */
     struct timeval tstart, tend;
     const char *foo = getenv("CPUMODE");
 
-    GPU_CHECKERROR(cudaMalloc((void **)&d_state, 
-                              sizeof(SudokuState<9>)));
-    GPU_CHECKERROR(cudaMalloc((void **)&d_rc, 
-                              sizeof(int)));
+    if(!gpumalloc) {
+        GPU_CHECKERROR(cudaMalloc((void **)&d_state,
+                                  sizeof(SudokuState<9>)));
+        GPU_CHECKERROR(cudaMalloc((void **)&d_rc,
+                                  sizeof(int)));
+        gpumalloc = 1;
+    }
     gettimeofday(&tstart, 0);
     if(foo) {
         h_rc = cpu_naive_recurse(&state);
@@ -874,13 +1245,16 @@ void test_basics2(SudokuState<9> &state) {
     gettimeofday(&tend, 0);
     std::cerr << "GOT OVERALL RC " << h_rc << std::endl;
     std::cerr << "TOOK TIME " << timeval_diff(&tstart, &tend) * 1000.0 << " ms" << std::endl;
-    cudaFree(d_state);
-    cudaFree(d_rc);
+    /* we don't free here in the interest of bulk mode */
+    //cudaFree(d_state);
+    //cudaFree(d_rc);
     if(check_state<3>(state)) {
         std::cerr << "PASS" << std::endl;
+        return 1;
     }
     else {
         std::cerr << "*****FAIL*****" << std::endl;
+        return 0;
     }
 }
 
@@ -893,9 +1267,9 @@ void test_basics(SudokuState<9> &state) {
     struct timeval tstart, tend;
 
     gettimeofday(&tstart, 0);
-    GPU_CHECKERROR(cudaMalloc((void **)&d_state, 
+    GPU_CHECKERROR(cudaMalloc((void **)&d_state,
                               sizeof(SudokuState<9>)));
-    GPU_CHECKERROR(cudaMalloc((void **)&d_rc, 
+    GPU_CHECKERROR(cudaMalloc((void **)&d_rc,
                               sizeof(int)));
     GPU_CHECKERROR(cudaMemset(d_rc, 0, sizeof(int)));
 
@@ -935,9 +1309,9 @@ void test_basics(SudokuState<9> &state) {
     std::cerr << "TOOK TIME " << timeval_diff(&tstart, &tend) * 1000.0 << " ms" << std::endl;
     cudaFree(d_state);
     cudaFree(d_rc);
-    
 
-    
+
+
     //print_state(state);
     check_state<3>(state);
 }
@@ -977,7 +1351,9 @@ int main(int argc, char **argv) {
             fill_state_from_problem(&states[i], problem);
         }
         for(int i=0;i<states.size();++i) {
-            test_basics2(states[i]);
+            if(!test_basics2(states[i])) {
+                std::cerr << vs[i] << std::endl;
+            }
         }
         return 0;
     }
@@ -1001,5 +1377,9 @@ int main(int argc, char **argv) {
     fill_state_from_problem(&mystate, problem);
     //print_state(mystate);
     test_basics2(mystate);
+    if(gpumalloc) {
+        cudaFree(d_state);
+        cudaFree(d_rc);
+    }
     return 0;
 }
