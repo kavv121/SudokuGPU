@@ -591,18 +591,20 @@ void fill_state_from_problem(SudokuState<SIZE> *state, const SudokuProblem<SIZE>
 }
 
 template<int RSIZE>
-void check_state(const SudokuState<RSIZE*RSIZE> &s) {
+int check_state(const SudokuState<RSIZE*RSIZE> &s) {
+    const char *foo = getenv("VERBOSE");
     bool ok = true;
     for(int r=0;r<RSIZE*RSIZE;++r) {
         for(int c=0;c<RSIZE*RSIZE;++c) {
             const uint32_t bs = s.bitstate[r][c];
             if(bs == 0 || (bs & (bs-1)) != 0) {
-                std::cerr << "Row " << r << " " << "col " << c << " not singleton!" << std::endl;
+                if(foo)
+                    std::cerr << "Row " << r << " " << "col " << c << " not singleton!" << std::endl;
                 ok = false;
             }
         }
     }
-    if(!ok){return;}
+    if(!ok){return 0;}
     //row check
     const uint32_t GOAL = (1u << (RSIZE*RSIZE)) - 1;
     for(int r=0;r<RSIZE*RSIZE;++r) {
@@ -613,12 +615,13 @@ void check_state(const SudokuState<RSIZE*RSIZE> &s) {
             xx |= s.bitstate[nr][nc];
         }
         if(xx != GOAL) {
-            std::cerr << "Row " << r << " is no good" << std::endl;
+            if(foo)
+                std::cerr << "Row " << r << " is no good" << std::endl;
             ok = false;
             break;
         }
     }
-    if(!ok){return;}
+    if(!ok){return 0;}
     for(int c=0;c<RSIZE*RSIZE;++c) {
         uint32_t xx = 0;
         for(int i=0;i<9;++i) {
@@ -627,12 +630,13 @@ void check_state(const SudokuState<RSIZE*RSIZE> &s) {
             xx |= s.bitstate[nr][nc];
         }
         if(xx != GOAL) {
-            std::cerr << "Col " << c << " is no good" << std::endl;
+            if(foo)
+                std::cerr << "Col " << c << " is no good" << std::endl;
             ok = false;
             break;
         }
     }
-    if(!ok){return;}
+    if(!ok){return 0;}
     for(int br=0;br<RSIZE && ok;++br) {
         for(int bc=0;bc<RSIZE;++bc) {
             uint32_t xx = 0;
@@ -642,14 +646,17 @@ void check_state(const SudokuState<RSIZE*RSIZE> &s) {
                 xx |= s.bitstate[nr][nc];
             }
             if(xx != GOAL) {
-                std::cerr << "Region " << br << "," << bc << " is no good" << std::endl;
+                if(foo)
+                    std::cerr << "Region " << br << "," << bc << " is no good" << std::endl;
                 ok = false;
                 break;
             }
         }
     }
-    if(!ok){return;}
-    std::cerr << "ALL GOOD!" << std::endl;
+    if(!ok){return 0;}
+    if(foo)
+        std::cerr << "ALL GOOD!" << std::endl;
+    return 1;
 }
 
 static double timeval_diff(const struct timeval *start, const struct timeval *end) {
@@ -869,7 +876,12 @@ void test_basics2(SudokuState<9> &state) {
     std::cerr << "TOOK TIME " << timeval_diff(&tstart, &tend) * 1000.0 << " ms" << std::endl;
     cudaFree(d_state);
     cudaFree(d_rc);
-    check_state<3>(state);
+    if(check_state<3>(state)) {
+        std::cerr << "PASS" << std::endl;
+    }
+    else {
+        std::cerr << "*****FAIL*****" << std::endl;
+    }
 }
 
 #if 0
