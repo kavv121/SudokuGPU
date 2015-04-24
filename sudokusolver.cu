@@ -8,7 +8,12 @@
 #include <sys/time.h>
 
 
+#define NUM_STACK 80
 //#define GPUDEBUG
+//#define ENABLE_TRIPLE
+//#define ENABLE_INTERSECTION
+//#define ENABLE_XWING
+//#define ENABLE_YWING
 
 #ifdef GPUDEBUG
 #define GPU_PF(...) printf(__VA_ARGS__)
@@ -47,6 +52,7 @@ template<int SIZE>
 struct SudokuState {
     uint32_t bitstate[SIZE][SIZE];
     uint8_t  work_flag[SIZE][SIZE]; //flags to cache work done
+    int8_t curr_r, curr_c, curr_dig; //counter for recursion
 };
 
 template<int SIZE>
@@ -908,8 +914,16 @@ __global__ void ywing_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
                     do_remove_mask(&s.bitstate[r][c], rval, &block_status);
                 }
             }
+            __syncthreads();
+            if(block_status == STAT_UPDATED) {
+                goto ending;
+            }
+            if(!block_ok) {
+                goto ending;
+            }
         }
     }
+ending:;
     if(block_ok && block_status == STAT_UPDATED)
     {
         p->bitstate[r][c] = s.bitstate[r][c];
@@ -1014,69 +1028,9 @@ static double timeval_diff(const struct timeval *start, const struct timeval *en
                   (end->tv_sec  - start->tv_sec);
 }
 
-#define RSIZE 3
 #define SIZE 9
-__device__ int naive_recurse(SudokuState<9> *p) {
-    //const int RSIZE = 3;
-    //const int SIZE = RSIZE*RSIZE;
-    uint32_t hold_row[SIZE];
-    uint32_t hold_col[SIZE];
-    uint32_t hold_region[SIZE];
-    for(int r=0;r<SIZE;++r) {
-        for(int c=0;c<SIZE;++c) {
-            if(__popc(p->bitstate[r][c]) == 0){return 0;}
-        }
-    }
-    for(int r=0;r<SIZE;++r) {
-        for(int c=0;c<SIZE;++c) {
-            if(__popc(p->bitstate[r][c]) > 1 ){
-                uint32_t oldval = p->bitstate[r][c];
-                for(int q=0;q<SIZE;++q) {
-                    if(oldval & (1u<<q)) {
-                        const uint32_t mask = ~(1u<<q);
-                        const int baser = RSIZE * (r/RSIZE);
-                        const int basec = RSIZE * (c/RSIZE);
-                        //try doing this with q
-                        for(int i=0;i<SIZE;++i){
-                            if(i != c) {
-                                hold_row[i] = p->bitstate[r][i];
-                                p->bitstate[r][i] &= mask;
-                            }
-                            if(i != r) {
-                                hold_col[i] = p->bitstate[i][c];
-                                p->bitstate[i][c] &= mask;
-                            }
-                            const int nr = baser + (i/RSIZE);
-                            const int nc = basec + (i%RSIZE);
-                            if(!(nr == r && nc == c)) {
-                                hold_region[i] = p->bitstate[nr][nc];
-                                p->bitstate[nr][nc] &= mask;
-                            }
-                        }
-                        p->bitstate[r][c] = (1u<<q);
-                        if(naive_recurse(p)) {return 1;}
-                        p->bitstate[r][c] = oldval;
-                        for(int i=SIZE-1;i>=0;--i){
-                            const int nr = baser + (i/RSIZE);
-                            const int nc = basec + (i%RSIZE);
-                            if(!(nr == r && nc == c)) {
-                                p->bitstate[nr][nc] = hold_region[i];
-                            }
-                            if(i != r) {
-                                p->bitstate[i][c] = hold_col[i];
-                            }
-                            if(i != c) {
-                                p->bitstate[r][i] = hold_row[i];
-                            }
-                        }
-                    }
-                }
-                return 0;
-            }
-        }
-    }
-    return 1;
-}
+#define RSIZE 3
+
 int cpu_naive_recurse(SudokuState<9> *p) {
     //const int RSIZE = 3;
     //const int SIZE = RSIZE*RSIZE;
@@ -1149,19 +1103,50 @@ int cpu_naive_recurse(SudokuState<9> *p) {
     }
     return 1;
 }
-#undef RSIZE
 #undef SIZE
+#undef RSIZE
 
-__global__ void sudokusolver_gpu_naive(SudokuState<9> *p, int *rc) {
-    int rrc = naive_recurse(p);
-    *rc = rrc;
+template<int RSIZE>
+__device__ bool iterate_guess(SudokuState<RSIZE*RSIZE> *guesser, SudokuState<RSIZE*RSIZE> *dest) {
+    int rr = guesser->curr_r;
+    int cc = guesser->curr_c;
+    int dd = guesser->curr_dig;
+    //increment for next thing
+    ++dd;
+    if(dd == RSIZE*RSIZE){
+        dd = 0; ++cc;
+        if(cc == RSIZE*RSIZE) {
+            cc = 0;++rr;
+        }
+    }
+    for(;rr < RSIZE*RSIZE;++rr) {
+        for(;cc < RSIZE*RSIZE;++cc) {
+            if(__popc(guesser->bitstate[rr][cc]) <= 1){dd = 0;continue;}
+            for(;dd < RSIZE*RSIZE;++dd) {
+                if(guesser->bitstate[rr][cc] & (1u<<dd)) {
+                    //we found a spot to try
+                    memcpy(dest, guesser, sizeof(SudokuState<RSIZE*RSIZE>));
+                    dest->bitstate[rr][cc] = (1u << dd);
+                    guesser->curr_r = rr;
+                    guesser->curr_c = cc;
+                    guesser->curr_dig = dd;
+                    return true;
+                }
+            }
+            dd = 0;
+        }
+        cc = 0;
+    }
+    return false;
 }
 
 
 template<int RSIZE>
-__global__ void sudokusolver_gpu_main(SudokuState<RSIZE*RSIZE> *p, int *rc) {
+__global__ void sudokusolver_gpu_main(SudokuState<RSIZE*RSIZE> *p, SudokuState<RSIZE*RSIZE> *save_stack, int ss_size, int *rc) {
     const dim3 num_block(1,1,1);
     const dim3 threads_per_block(9,9,1);
+    int stack_ptr = 0;
+thetop:;
     for(*rc = STAT_UPDATED;*rc == STAT_UPDATED;) {
         *rc = STAT_NOCHG;
         __syncthreads();
@@ -1186,30 +1171,93 @@ __global__ void sudokusolver_gpu_main(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         GPU_PF("PAIR SEARCH - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
 
+#ifdef ENABLE_TRIPLE
         triple_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
         cudaDeviceSynchronize();
         GPU_PF("TRIPLE SEARCH - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
+#endif
 
+#ifdef ENABLE_INTERSECTION
         intersection_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
         cudaDeviceSynchronize();
         GPU_PF("INTERSECTION SEARCH - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
+#endif
 
+#ifdef ENABLE_XWING
         xwing_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
         cudaDeviceSynchronize();
         GPU_PF("XWING SEARCH - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
+#endif
 
+#ifdef ENABLE_YWING
         ywing_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
         cudaDeviceSynchronize();
         GPU_PF("YWING SEARCH - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
+#endif
 
+    }
+    //did we win?
+    if(*rc == STAT_FINISHED) {
+        return;
+    }
+    else if(*rc == STAT_NOTOK || stack_ptr >= ss_size) {
+        //we've hit a contradiction, so we need to iter the stack
+        while(stack_ptr > 0) {
+            /* remove the current guess from the save stack
+               */
+            SudokuState<RSIZE*RSIZE> &ss = save_stack[stack_ptr-1];
+            int nextdig;
+            for(nextdig=ss.curr_dig+1;nextdig<RSIZE*RSIZE;++nextdig) {
+                if(ss.bitstate[ss.curr_r][ss.curr_c] & (1u<<nextdig)) {
+                    ss.curr_dig = nextdig;
+                    memcpy(p, &ss, sizeof(SudokuState<RSIZE*RSIZE>));
+                    p->bitstate[ss.curr_r][ss.curr_c] = (1u<<nextdig);
+                    GPU_PF("NOW TRYING %d %d %d %d\n", stack_ptr-1, ss.curr_r, ss.curr_c, nextdig);
+                    goto thetop;
+                }
+            }
+            //no next digit, we're also a failure!
+            GPU_PF("Now popping to %d\n", stack_ptr-1);
+            --stack_ptr;
+        }
+    }
+    else if(stack_ptr < ss_size) {
+        //we are stuck, but not dead, make a guess and add to stack, unless we're out of stack
+        memcpy(&save_stack[stack_ptr], p, sizeof(SudokuState<RSIZE*RSIZE>));
+        int bestr = 0;int bestc = 0; int bestsc = RSIZE*RSIZE+1;
+        for(int rr=0;rr<RSIZE*RSIZE;++rr) {
+            for(int cc=0;cc<RSIZE*RSIZE;++cc) {
+                int x = __popc(p->bitstate[rr][cc]);
+                if(x > 1 && x < bestsc) {
+                    bestr = rr;bestc = cc;bestsc = x;
+                }
+            }
+        }
+        save_stack[stack_ptr].curr_r = bestr;
+        save_stack[stack_ptr].curr_c = bestc;
+        save_stack[stack_ptr].curr_dig = 0;
+        SudokuState<RSIZE*RSIZE> &ss = save_stack[stack_ptr];
+        for(int nextdig=0;nextdig<RSIZE*RSIZE;++nextdig) {
+            if(ss.bitstate[ss.curr_r][ss.curr_c] & (1u<<nextdig)) {
+                GPU_PF("GUESS TIME %d %d %d %d %d\n", stack_ptr, ss.curr_r, ss.curr_c, nextdig, bestsc);
+                ss.curr_dig = nextdig;
+                memcpy(p, &ss, sizeof(SudokuState<RSIZE*RSIZE>));
+                p->bitstate[ss.curr_r][ss.curr_c] = (1u<<nextdig);
+                ++stack_ptr;
+                goto thetop;
+            }
+        }
+        //we really shouldn't get here, let the whole thing die
+        GPU_PF("SHOULDNT GET HERE!!!!\n");
     }
 }
 
 static SudokuState<9> *d_state;
+static SudokuState<9> *d_sstack;
 static int *d_rc;
 static int gpumalloc = 0;
 
@@ -1218,10 +1266,13 @@ int test_basics2(SudokuState<9> &state) {
     /* TODO: better timing */
     struct timeval tstart, tend;
     const char *foo = getenv("CPUMODE");
+    const int num_stack = NUM_STACK;
 
     if(!gpumalloc) {
         GPU_CHECKERROR(cudaMalloc((void **)&d_state,
                                   sizeof(SudokuState<9>)));
+        GPU_CHECKERROR(cudaMalloc((void **)&d_sstack,
+                                  num_stack*sizeof(SudokuState<9>)));
         GPU_CHECKERROR(cudaMalloc((void **)&d_rc,
                                   sizeof(int)));
         gpumalloc = 1;
@@ -1236,7 +1287,7 @@ int test_basics2(SudokuState<9> &state) {
         GPU_CHECKERROR(cudaMemcpy(d_state, &state, sizeof(SudokuState<9>), cudaMemcpyHostToDevice));
         const dim3 num_block(1,1,1);
         const dim3 threads_per_block(1,1,1);
-        sudokusolver_gpu_main<3><<<num_block, threads_per_block>>>(d_state, d_rc);
+        sudokusolver_gpu_main<3><<<num_block, threads_per_block>>>(d_state, d_sstack, num_stack, d_rc);
         GPU_CHECKERROR(cudaGetLastError());
         GPU_CHECKERROR(cudaMemcpy(&h_rc, d_rc, sizeof(int), cudaMemcpyDeviceToHost));
         GPU_CHECKERROR(cudaMemcpy(&state, d_state, sizeof(SudokuState<9>), cudaMemcpyDeviceToHost));
