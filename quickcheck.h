@@ -27,23 +27,19 @@ __global__ void quickcheck(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     __syncthreads();
     tmp_block[r][mydig] = 1;
     __syncthreads();
-    if(tmp_block[r][c] == 0) {
+    if(tmp_block[r][c] != 1) {
         block_ok = 0;
     }
     //cols
-    tmp_block[r][c] = 0;
+    tmp_block[c][mydig] = 2;
     __syncthreads();
-    tmp_block[c][mydig] = 1;
-    __syncthreads();
-    if(tmp_block[r][c] == 0) {
+    if(tmp_block[r][c] != 2) {
         block_ok = 0;
     }
     //regions
-    tmp_block[r][c] = 0;
+    tmp_block[RSIZE*(r/RSIZE) + (c/RSIZE)][mydig] = 3;
     __syncthreads();
-    tmp_block[RSIZE*(r/RSIZE) + (c/RSIZE)][mydig] = 1;
-    __syncthreads();
-    if(tmp_block[r][c] == 0) {
+    if(tmp_block[r][c] != 3) {
         block_ok = 0;
     }
 

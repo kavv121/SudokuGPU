@@ -10,6 +10,7 @@
 
 #define NUM_STACK 80
 //#define GPUDEBUG
+#define ENABLE_PAIR
 //#define ENABLE_TRIPLE
 //#define ENABLE_INTERSECTION
 //#define ENABLE_XWING
@@ -745,20 +746,25 @@ thetop:;
         GPU_PF("QUICKCHECK - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
 
-        simple_cand_elim<RSIZE><<<num_block, threads_per_block>>>(p, rc);
+        //simple_cand_elim<RSIZE><<<num_block, threads_per_block>>>(p, rc);
+        simple_cand_elim_v2<RSIZE><<<num_block, threads_per_block>>>(p, rc);
         cudaDeviceSynchronize();
         GPU_PF("SIMPLE - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
 
         singleton_search<RSIZE><<<num_block, threads_per_block>>>(p,rc);
+        //singleton_search_v2<RSIZE><<<num_block, threads_per_block>>>(p,rc);
         cudaDeviceSynchronize();
         GPU_PF("SINGLETON - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
 
-        pair_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
+#ifdef ENABLE_PAIR
+        //pair_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
+        pair_search_v2<RSIZE><<<super_num_block, threads_per_block>>>(p, rc);
         cudaDeviceSynchronize();
         GPU_PF("PAIR SEARCH - GOT RC %d\n", *rc);
         if(*rc != STAT_NOCHG){continue;}
+#endif
 
 #ifdef ENABLE_TRIPLE
         triple_search<RSIZE><<<num_block, threads_per_block>>>(p, rc);
