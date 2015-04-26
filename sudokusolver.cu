@@ -851,16 +851,17 @@ thetop:;
     }
 }
 
+
 static SudokuState<9> *d_state;
 static SudokuState<9> *d_sstack;
 static int *d_rc;
 static int gpumalloc = 0;
 
 int test_basics2(SudokuState<9> &state) {
+
     int h_rc;
     /* TODO: better timing */
     struct timeval tstart, tend;
-    const char *foo = getenv("CPUMODE");
     const int num_stack = NUM_STACK;
 
     if(!gpumalloc) {
@@ -873,10 +874,7 @@ int test_basics2(SudokuState<9> &state) {
         gpumalloc = 1;
     }
     gettimeofday(&tstart, 0);
-    if(foo) {
-        h_rc = cpu_naive_recurse(&state);
-    }
-    else {
+    {
         GPU_CHECKERROR(cudaMemset(d_rc, 0, sizeof(int)));
 
         GPU_CHECKERROR(cudaMemcpy(d_state, &state, sizeof(SudokuState<9>), cudaMemcpyHostToDevice));
@@ -904,64 +902,69 @@ int test_basics2(SudokuState<9> &state) {
     }
 }
 
-#if 0
-void test_basics(SudokuState<9> &state) {
-    SudokuState<9> *d_state;
-    int *d_rc;
-    int h_rc;
-    /* TODO: better timing */
+template<int RSIZE>
+void run_batch(SudokuState<RSIZE*RSIZE> *states, size_t num_states) {
+    const int num_streams = 8;
+    SudokuState<RSIZE*RSIZE> *d_states[num_streams];
+    SudokuState<RSIZE*RSIZE> *d_sstack[num_streams];
+    int *d_rcs;
+    const int num_stack = NUM_STACK;
+
     struct timeval tstart, tend;
+    std::vector<int> h_rcs(num_states, 0);
+    std::vector<cudaEvent_t> e_starts(num_states);
+    std::vector<cudaEvent_t> e_stops(num_states);
+    std::vector<cudaStream_t> streams(num_streams);
 
-    gettimeofday(&tstart, 0);
-    GPU_CHECKERROR(cudaMalloc((void **)&d_state,
-                              sizeof(SudokuState<9>)));
-    GPU_CHECKERROR(cudaMalloc((void **)&d_rc,
-                              sizeof(int)));
-    GPU_CHECKERROR(cudaMemset(d_rc, 0, sizeof(int)));
-
-    GPU_CHECKERROR(cudaMemcpy(d_state, &state, sizeof(SudokuState<9>), cudaMemcpyHostToDevice));
-    dim3 num_block(1,1,1);
-    dim3 threads_per_block(9,9,1);
-    for(h_rc = STAT_UPDATED;h_rc == STAT_UPDATED;)
-    {
-        h_rc = STAT_NOCHG;
-        GPU_CHECKERROR(cudaMemset(d_rc, 0, sizeof(int)));
-
-        simple_cand_elim<3><<<num_block, threads_per_block>>>(d_state, d_rc);
-        GPU_CHECKERROR(cudaGetLastError());
-        GPU_CHECKERROR(cudaMemcpy(&h_rc, d_rc, sizeof(int), cudaMemcpyDeviceToHost));
-        cudaDeviceSynchronize();
-        fprintf(stderr, "SIMPLE - GOT RC %d\n", h_rc);
-        if(h_rc != STAT_NOCHG){continue;}
-
-        singleton_search<3><<<num_block, threads_per_block>>>(d_state, d_rc);
-        GPU_CHECKERROR(cudaGetLastError());
-        GPU_CHECKERROR(cudaMemcpy(&h_rc, d_rc, sizeof(int), cudaMemcpyDeviceToHost));
-        cudaDeviceSynchronize();
-        fprintf(stderr, "SINGLETON - GOT RC %d\n", h_rc);
-        if(h_rc != STAT_NOCHG){continue;}
-
-        pair_search<3><<<num_block, threads_per_block>>>(d_state, d_rc);
-        GPU_CHECKERROR(cudaGetLastError());
-        GPU_CHECKERROR(cudaMemcpy(&h_rc, d_rc, sizeof(int), cudaMemcpyDeviceToHost));
-        cudaDeviceSynchronize();
-        fprintf(stderr, "PAIR SEARCH - GOT RC %d\n", h_rc);
-        if(h_rc != STAT_NOCHG){continue;}
+    const dim3 num_block(1,1,1);
+    const dim3 threads_per_block(1,1,1);
+    for(int i=0;i<num_streams;++i) {
+        GPU_CHECKERROR(cudaMalloc((void **)&d_states[i],
+                                  sizeof(states[0])));
+        GPU_CHECKERROR(cudaMalloc((void **)&d_sstack[i],
+                                  num_stack*sizeof(states[0])));
+        GPU_CHECKERROR(cudaStreamCreate(&streams[i]));
 
     }
-    GPU_CHECKERROR(cudaMemcpy(&state, d_state, sizeof(SudokuState<9>), cudaMemcpyDeviceToHost));
-    cudaDeviceSynchronize();
+    for(int i=0;i<num_states;++i) {
+        GPU_CHECKERROR(cudaEventCreate(&e_starts[i]));
+        GPU_CHECKERROR(cudaEventCreate(&e_stops[i]));
+    }
+    GPU_CHECKERROR(cudaMalloc((void **)&d_rcs,
+                              num_states * sizeof(int)));
+
+    gettimeofday(&tstart, 0);
+    {
+        GPU_CHECKERROR(cudaMemset((void *)d_rcs, 0, num_states * sizeof(int)));
+        for(int i=0;i<num_states;++i) {
+            int stream_num = i % num_streams;
+            GPU_CHECKERROR(cudaEventRecord(e_starts[i], streams[stream_num]));
+            GPU_CHECKERROR(cudaMemcpyAsync(d_states[stream_num], states + i, sizeof(states[i]), cudaMemcpyHostToDevice, streams[stream_num]));
+            sudokusolver_gpu_main<RSIZE><<<num_block, threads_per_block, 0, streams[stream_num]>>>(d_states[stream_num], d_sstack[stream_num], num_stack, &d_rcs[i]);
+            GPU_CHECKERROR(cudaMemcpyAsync(states+i, d_states[stream_num], sizeof(states[i]), cudaMemcpyDeviceToHost, streams[stream_num]));
+            GPU_CHECKERROR(cudaMemcpyAsync(&h_rcs[i], d_rcs + i, sizeof(int), cudaMemcpyDeviceToHost, streams[stream_num]));
+            
+            GPU_CHECKERROR(cudaEventRecord(e_stops[i], streams[stream_num]));
+        }
+    }
+    for(int i=0;i<num_states;++i) {
+        cudaEventSynchronize(e_stops[i]);
+    }
     gettimeofday(&tend, 0);
-    std::cerr << "TOOK TIME " << timeval_diff(&tstart, &tend) * 1000.0 << " ms" << std::endl;
-    cudaFree(d_state);
-    cudaFree(d_rc);
 
+    for(int i=0;i<num_states;++i) {
+        float time_taken;
+        cudaEventElapsedTime(&time_taken, e_starts[i], e_stops[i]);
+        std::cout << "PUZZLE " << i << " RC " << h_rcs[i] << " TIME " << time_taken << std::endl;
+        if(check_state<RSIZE>(states[i])) {
+            std::cout << "PASS" << std::endl;
+        }
+        else {
+            std::cout << "FAIL" << std::endl;
+        }
 
-
-    //print_state(state);
-    check_state<3>(state);
+    }
 }
-#endif
 
 
 int main(int argc, char **argv) {
@@ -996,11 +999,14 @@ int main(int argc, char **argv) {
             }
             fill_state_from_problem(&states[i], problem);
         }
+        run_batch<3>(&states[0], states.size());
+        /*
         for(int i=0;i<states.size();++i) {
             if(!test_basics2(states[i])) {
                 std::cerr << vs[i] << std::endl;
             }
         }
+        */
         return 0;
     }
     std::string s;
