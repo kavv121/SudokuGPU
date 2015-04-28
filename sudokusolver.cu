@@ -562,7 +562,7 @@ int check_state(const SudokuState<RSIZE*RSIZE> &s) {
     const uint32_t GOAL = (1u << (RSIZE*RSIZE)) - 1;
     for(int r=0;r<RSIZE*RSIZE;++r) {
         uint32_t xx = 0;
-        for(int i=0;i<9;++i) {
+        for(int i=0;i<RSIZE*RSIZE;++i) {
             const int nr = r;
             const int nc = i;
             xx |= s.bitstate[nr][nc];
@@ -577,7 +577,7 @@ int check_state(const SudokuState<RSIZE*RSIZE> &s) {
     if(!ok){return 0;}
     for(int c=0;c<RSIZE*RSIZE;++c) {
         uint32_t xx = 0;
-        for(int i=0;i<9;++i) {
+        for(int i=0;i<RSIZE*RSIZE;++i) {
             const int nr = i;
             const int nc = c;
             xx |= s.bitstate[nr][nc];
@@ -593,9 +593,9 @@ int check_state(const SudokuState<RSIZE*RSIZE> &s) {
     for(int br=0;br<RSIZE && ok;++br) {
         for(int bc=0;bc<RSIZE;++bc) {
             uint32_t xx = 0;
-            for(int i=0;i<9;++i) {
-                const int nr = RSIZE*br + (i/3);
-                const int nc = RSIZE*bc + (i%3);
+            for(int i=0;i<RSIZE*RSIZE;++i) {
+                const int nr = RSIZE*br + (i/RSIZE);
+                const int nc = RSIZE*bc + (i%RSIZE);
                 xx |= s.bitstate[nr][nc];
             }
             if(xx != GOAL) {
@@ -909,6 +909,8 @@ void run_batch(SudokuState<RSIZE*RSIZE> *states, size_t num_states) {
     SudokuState<RSIZE*RSIZE> *d_sstack[num_streams];
     int *d_rcs;
     const int num_stack = NUM_STACK;
+    int VV = 0;
+    if(getenv("VERBOSE") != NULL){VV = 1;}
 
     struct timeval tstart, tend;
     std::vector<int> h_rcs(num_states, 0);
@@ -956,6 +958,9 @@ void run_batch(SudokuState<RSIZE*RSIZE> *states, size_t num_states) {
         float time_taken;
         cudaEventElapsedTime(&time_taken, e_starts[i], e_stops[i]);
         std::cout << "PUZZLE " << i << " RC " << h_rcs[i] << " TIME " << time_taken << std::endl;
+        if(VV) {
+            print_state<RSIZE*RSIZE>(states[i]);
+        }
         if(check_state<RSIZE>(states[i])) {
             std::cout << "PASS" << std::endl;
         }
@@ -972,10 +977,20 @@ int main(int argc, char **argv) {
         std::cerr << "Entering bulk mode on file " << argv[1] << std::endl;
         std::ifstream fin(argv[1]);
         std::vector<std::string> vs;
+
+        int RS = 3;
+        if(argc > 2) {
+            sscanf(argv[2], "%d", &RS);
+        }
+        if(!(RS >= 3 && RS <= 5)) {
+            std::cerr << "NOT VALID SIZE" << std::endl;
+        }
+        int SS = RS*RS;
+
         {
             std::string s;
             while(fin >> s) {
-                if(s.size() != 81){
+                if(s.size() != SS*SS){
                     std::cerr << "Warning, incomplete string '" << s << "', skipping" << std::endl;
                 }
                 else {
@@ -983,30 +998,77 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        std::vector<SudokuState<9> > states(vs.size());
-        for(int i=0;i<vs.size();++i)
-        {
-            SudokuProblem<9> problem;
-            memset(&problem, 0, sizeof(problem));
-            const std::string &s = vs[i];
-            for(int t=0;t<s.size();++t) {
-                if(s[t] >= '1' && s[t] <= '9') {
-                    int dig = s[t] - '0';
-                    int r = t/9;
-                    int c = t%9;
-                    problem.givens[r][c] = dig;
+
+        if(RS == 3) {
+            std::vector<SudokuState<9> > states(vs.size());
+            for(int i=0;i<vs.size();++i)
+            {
+                SudokuProblem<9> problem;
+                memset(&problem, 0, sizeof(problem));
+                const std::string &s = vs[i];
+                for(int t=0;t<s.size();++t) {
+                    if(s[t] >= '1' && s[t] <= '9') {
+                        int dig = s[t] - '0';
+                        int r = t/9;
+                        int c = t%9;
+                        problem.givens[r][c] = dig;
+                    }
                 }
+                fill_state_from_problem(&states[i], problem);
             }
-            fill_state_from_problem(&states[i], problem);
+            run_batch<3>(&states[0], states.size());
         }
-        run_batch<3>(&states[0], states.size());
-        /*
-        for(int i=0;i<states.size();++i) {
-            if(!test_basics2(states[i])) {
-                std::cerr << vs[i] << std::endl;
+        else if(RS == 4) {
+            std::vector<SudokuState<16> > states(vs.size());
+            for(int i=0;i<vs.size();++i)
+            {
+                SudokuProblem<16> problem;
+                memset(&problem, 0, sizeof(problem));
+                const std::string &s = vs[i];
+                for(int t=0;t<s.size();++t) {
+                    if(s[t] >= '1' && s[t] <= '9') {
+                        int dig = s[t] - '0';
+                        int r = t/16;
+                        int c = t%16;
+                        problem.givens[r][c] = dig;
+                    }
+                    else if(s[t] >= 'A' && s[t] <= 'G') {
+                        int dig = s[t] - 'A' + 10;
+                        int r = t/16;
+                        int c = t%16;
+                        problem.givens[r][c] = dig;
+                    }
+                }
+                fill_state_from_problem(&states[i], problem);
             }
+            run_batch<4>(&states[0], states.size());
         }
-        */
+        else if(RS == 5) {
+            std::vector<SudokuState<25> > states(vs.size());
+            for(int i=0;i<vs.size();++i)
+            {
+                SudokuProblem<25> problem;
+                memset(&problem, 0, sizeof(problem));
+                const std::string &s = vs[i];
+                for(int t=0;t<s.size();++t) {
+                    if(s[t] >= '1' && s[t] <= '9') {
+                        int dig = s[t] - '0';
+                        int r = t/25;
+                        int c = t%25;
+                        problem.givens[r][c] = dig;
+                    }
+                    else if(s[t] >= 'A' && s[t] <= 'Z') {
+                        int dig = s[t] - 'A' + 10;
+                        int r = t/25;
+                        int c = t%25;
+                        problem.givens[r][c] = dig;
+
+                    }
+                }
+                fill_state_from_problem(&states[i], problem);
+            }
+            run_batch<5>(&states[0], states.size());
+        }
         return 0;
     }
     std::string s;
