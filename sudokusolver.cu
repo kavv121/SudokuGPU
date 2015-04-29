@@ -903,6 +903,32 @@ int test_basics2(SudokuState<9> &state) {
 }
 
 template<int RSIZE>
+void pretty_print(SudokuState<RSIZE> &state) {
+    for(int i=0;i<RSIZE;++i)
+    {
+        for(int j=0;j<RSIZE;++j) {
+            uint32_t x = state.bitstate[i][j];
+            if(x && !(x & (x-1))) {
+                for(int i=0;i<32;++i) {
+                    if(x & (1u<<i)) {
+                        if(i+1 < 10) {
+                            std::cout << (char)('0'+(i+1));
+                        }
+                        else {
+                            std::cout << (char)('A'+(i+1-10));
+                        }
+                    }
+                }
+            }
+            else {
+                std::cout << ".";
+            }
+        }
+        std::cout << std::endl;
+    }
+}
+
+template<int RSIZE>
 void run_batch(SudokuState<RSIZE*RSIZE> *states, size_t num_states) {
     const int num_streams = 8;
     SudokuState<RSIZE*RSIZE> *d_states[num_streams];
@@ -911,12 +937,18 @@ void run_batch(SudokuState<RSIZE*RSIZE> *states, size_t num_states) {
     const int num_stack = NUM_STACK;
     int VV = 0;
     if(getenv("VERBOSE") != NULL){VV = 1;}
+    int PP = 0;
+    if(getenv("PRETTY") != NULL){PP = 1;}
 
     struct timeval tstart, tend;
     std::vector<int> h_rcs(num_states, 0);
     std::vector<cudaEvent_t> e_starts(num_states);
     std::vector<cudaEvent_t> e_stops(num_states);
     std::vector<cudaStream_t> streams(num_streams);
+
+    if(num_states > 0 && PP) {
+        pretty_print(states[0]);
+    }
 
     const dim3 num_block(1,1,1);
     const dim3 threads_per_block(1,1,1);
@@ -954,10 +986,15 @@ void run_batch(SudokuState<RSIZE*RSIZE> *states, size_t num_states) {
     }
     gettimeofday(&tend, 0);
 
+    if(num_states > 0 && PP) {
+        std::cout << std::endl;
+        pretty_print(states[0]);
+    }
+
     for(int i=0;i<num_states;++i) {
         float time_taken;
         cudaEventElapsedTime(&time_taken, e_starts[i], e_stops[i]);
-        std::cout << "PUZZLE " << i << " RC " << h_rcs[i] << " TIME " << time_taken << std::endl;
+        std::cout << "PUZZLE " << i << " RC " << h_rcs[i] << " TIME " << time_taken << " ms" << std::endl;
         if(VV) {
             print_state<RSIZE*RSIZE>(states[i]);
         }
