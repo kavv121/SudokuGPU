@@ -11,10 +11,10 @@
 #define NUM_STACK 80
 //#define GPUDEBUG
 #define ENABLE_PAIR
-//#define ENABLE_TRIPLE
-//#define ENABLE_INTERSECTION
-//#define ENABLE_XWING
-//#define ENABLE_YWING
+#define ENABLE_TRIPLE
+#define ENABLE_INTERSECTION
+#define ENABLE_XWING
+#define ENABLE_YWING
 
 #ifdef GPUDEBUG
 #define GPU_PF(...) printf(__VA_ARGS__)
