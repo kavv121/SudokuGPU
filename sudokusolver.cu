@@ -301,6 +301,9 @@ __global__ void intersection_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
     if(r == 0 && c == 0){block_status = STAT_NOCHG;block_ok = 1;}
     //copy current values
     const uint32_t myval = p->bitstate[r][c];
+    const uint32_t BASEMASK = (RSIZE == 3)?0x49: (
+                              (RSIZE == 4)?0x1111: (
+                              (RSIZE == 5)?0x108421:0));
     s.bitstate[r][c] = myval;
     __syncthreads();
     /* look for pairs/triples in box */
@@ -327,7 +330,6 @@ __global__ void intersection_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
         //if bit counts mask == 000xxx000
         //  eliminate rest in row 1
         //...
-        //TODO: generalize this instead of hardcoding 9x9 values
         {
             //row intersection
             if(!(c >= basec && c < basec+RSIZE)) {
@@ -339,8 +341,7 @@ __global__ void intersection_search(SudokuState<RSIZE*RSIZE> *p, int *rc) {
             }
             //column intersection
             if(!(c >= baser && c < baser+RSIZE)) {
-                //TODO: find correct mask for given RSIZE
-                for(int x=0,mymask=0x49;x<RSIZE;++x, mymask<<=1) {
+                for(int x=0,mymask=BASEMASK;x<RSIZE;++x, mymask<<=1) {
                     if((bit_counts[r] & mymask) == bit_counts[r]) {
                         do_remove_mask(&s.bitstate[c][basec+x], (1u<<r), &block_status);
                     }
